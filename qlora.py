@@ -109,11 +109,11 @@ class DataArguments:
         },
     )
     source_max_len: int = field(
-        default=1024,
+        default=1024, #1024
         metadata={"help": "Maximum source sequence length. Sequences will be right padded (and possibly truncated)."},
     )
     target_max_len: int = field(
-        default=256,
+        default=512, #256
         metadata={"help": "Maximum target sequence length. Sequences will be right padded (and possibly truncated)."},
     )
     dataset: str = field(
@@ -129,6 +129,10 @@ class DataArguments:
 class TrainingArguments(transformers.Seq2SeqTrainingArguments):
     cache_dir: Optional[str] = field(
         default=None
+    )
+    deepspeed: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to DeepSpeed config file."}
     )
     train_on_source: Optional[bool] = field(
         default=False,
@@ -198,7 +202,8 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
     optim: str = field(default='paged_adamw_32bit', metadata={"help": 'The optimizer to be used'})
     per_device_train_batch_size: int = field(default=1, metadata={"help": 'The training batch size per GPU. Increase for better speed.'})
     gradient_accumulation_steps: int = field(default=16, metadata={"help": 'How many gradients to accumulate before to perform an optimizer step'})
-    max_steps: int = field(default=10000, metadata={"help": 'How many optimizer update steps to take'})
+    max_steps: int = field(default=150, metadata={"help": 'How many optimizer update steps to take'}) #10000;2000;500
+    # 200
     weight_decay: float = field(default=0.0, metadata={"help": 'The L2 weight decay rate of AdamW'}) # use lora dropout instead for regularization if needed
     learning_rate: float = field(default=0.0002, metadata={"help": 'The learnign rate'})
     remove_unused_columns: bool = field(default=False, metadata={"help": 'Removed unused columns. Needed to make this codebase work.'})
@@ -219,7 +224,7 @@ class GenerationArguments:
     # https://huggingface.co/docs/transformers/main_classes/text_generation#transformers.GenerationConfig
     # Length arguments
     max_new_tokens: Optional[int] = field(
-        default=256,
+        default=512, #256
         metadata={"help": "Maximum number of new tokens to be generated in evaluation or prediction loops"
                           "if predict_with_generate is set."}
     )
@@ -287,7 +292,7 @@ class SavePeftModelCallback(transformers.TrainerCallback):
         self.save_model(args, state, kwargs)
 
 def get_accelerate_model(args, checkpoint_dir):
-
+    print('getting accelerate model')
     if torch.cuda.is_available():
         n_gpus = torch.cuda.device_count()
     if is_ipex_available() and torch.xpu.is_available():
@@ -295,13 +300,23 @@ def get_accelerate_model(args, checkpoint_dir):
         
     max_memory = f'{args.max_memory_MB}MB'
     max_memory = {i: max_memory for i in range(n_gpus)}
-    device_map = "auto"
+    # device_map = "auto"
+    # device_map = 'cuda:0'
 
     # if we are in a distributed setting, we need to set the device map and max memory per device
     if os.environ.get('LOCAL_RANK') is not None:
         local_rank = int(os.environ.get('LOCAL_RANK', '0'))
         device_map = {'': local_rank}
         max_memory = {'': max_memory[local_rank]}
+    # local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    # torch.cuda.set_device(local_rank)
+    # device_map = {"": f"cuda:{local_rank}"}
+    # max_memory = {f"cuda:{local_rank}": "38GiB"} 
+
+    print(f"[DEBUG] device_map used: {device_map}")
+    print(f"max_memory{max_memory}")
+    # print(f"[DEBUG] hf_device_map from model: {getattr(model, 'hf_device_map', None)}")
+
 
 
     if args.full_finetune: assert args.bits in [16, 32]
@@ -311,10 +326,11 @@ def get_accelerate_model(args, checkpoint_dir):
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         cache_dir=args.cache_dir,
-        load_in_4bit=args.bits == 4,
+        # load_in_4bit=args.bits == 4,
         load_in_8bit=args.bits == 8,
-        device_map=device_map,
+        # device_map=device_map,
         max_memory=max_memory,
+        # max_memory = {i: '46000MB' for i in range(torch.cuda.device_count())},
         quantization_config=BitsAndBytesConfig(
             load_in_4bit=args.bits == 4,
             load_in_8bit=args.bits == 8,
@@ -353,7 +369,7 @@ def get_accelerate_model(args, checkpoint_dir):
         trust_remote_code=args.trust_remote_code,
         use_auth_token=args.use_auth_token,
     )
-    if tokenizer._pad_token is None:
+    if tokenizer.pad_token is None:
         smart_tokenizer_and_embedding_resize(
             special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN),
             tokenizer=tokenizer,
@@ -365,13 +381,27 @@ def get_accelerate_model(args, checkpoint_dir):
         # Note that these are present in the vocabulary.
         # Note also that `model.config.pad_token_id` is 0 which corresponds to `<unk>` token.
         print('Adding special tokens.')
-        tokenizer.add_special_tokens({
-                "eos_token": tokenizer.convert_ids_to_tokens(model.config.eos_token_id),
-                "bos_token": tokenizer.convert_ids_to_tokens(model.config.bos_token_id),
-                "unk_token": tokenizer.convert_ids_to_tokens(
-                    model.config.pad_token_id if model.config.pad_token_id != -1 else tokenizer.pad_token_id
-                ),
-        })
+        special_tokens_dict = {}
+
+        if tokenizer.eos_token is None:
+            special_tokens_dict["eos_token"] = "</s>"
+        if tokenizer.bos_token is None:
+            special_tokens_dict["bos_token"] = "<s>"
+        if tokenizer.unk_token is None:
+            special_tokens_dict["unk_token"] = "<unk>"
+        if tokenizer.pad_token is None:
+            special_tokens_dict["pad_token"] = "[PAD]"
+
+        if special_tokens_dict:
+            tokenizer.add_special_tokens(special_tokens_dict)
+            model.resize_token_embeddings(len(tokenizer))
+        # tokenizer.add_special_tokens({
+        #         "eos_token": tokenizer.convert_ids_to_tokens(model.config.eos_token_id),
+        #         "bos_token": tokenizer.convert_ids_to_tokens(model.config.bos_token_id),
+        #         "unk_token": tokenizer.convert_ids_to_tokens(
+        #             model.config.pad_token_id if model.config.pad_token_id != -1 else tokenizer.pad_token_id
+        #         ),
+        # })
     
     if not args.full_finetune:
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
@@ -392,6 +422,7 @@ def get_accelerate_model(args, checkpoint_dir):
                 task_type="CAUSAL_LM",
             )
             model = get_peft_model(model, config)
+            # model._set_static_graph()
 
     for name, module in model.named_modules():
         if isinstance(module, LoraLayer):
@@ -686,16 +717,30 @@ def get_last_checkpoint(checkpoint_dir):
     return None, False # first training
 
 def train():
+    import torch, os
+    print("Memory Allocated:", torch.cuda.memory_allocated() / 1e9, "GB")
+    print("Memory Reserved:", torch.cuda.memory_reserved() / 1e9, "GB")
+
+    print(f"[DEBUG] RANK: {os.environ.get('RANK')}, LOCAL_RANK: {os.environ.get('LOCAL_RANK')}")
+    print(f"[DEBUG] torch.cuda.device_count() = {torch.cuda.device_count()}")
+    print(f"[DEBUG] torch.cuda.current_device() = {torch.cuda.current_device()}")
+    print(f"[DEBUG] torch.cuda.get_device_name = {torch.cuda.get_device_name(torch.cuda.current_device())}")
+
     hfparser = transformers.HfArgumentParser((
         ModelArguments, DataArguments, TrainingArguments, GenerationArguments
     ))
+    print('1')
     model_args, data_args, training_args, generation_args, extra_args = \
         hfparser.parse_args_into_dataclasses(return_remaining_strings=True)
+    print('2')
     training_args.generation_config = transformers.GenerationConfig(**vars(generation_args))
+    print('3')
     args = argparse.Namespace(
         **vars(model_args), **vars(data_args), **vars(training_args)
     )
+    print("args:")
     print(args)
+    print("---")
     
     checkpoint_dir, completed_training = get_last_checkpoint(args.output_dir)
     if completed_training:
@@ -704,6 +749,7 @@ def train():
     model, tokenizer = get_accelerate_model(args, checkpoint_dir)
 
     model.config.use_cache = False
+    # model.cuda()
     print('loaded model')
     set_seed(args.seed)
 
@@ -800,6 +846,7 @@ def train():
         logger.info("*** Train ***")
         # Note: `resume_from_checkpoint` not supported for adapter checkpoints by HF.
         # Currently adapter checkpoint is reloaded as expected but optimizer/scheduler states are not.
+
         train_result = trainer.train()
         metrics = train_result.metrics
         trainer.log_metrics("train", metrics)
@@ -838,4 +885,6 @@ def train():
             fout.write(json.dumps(all_metrics))
 
 if __name__ == "__main__":
+    print("Starting qlora...")
+    print(f"[DEBUG] sys.argv = {sys.argv}")
     train()

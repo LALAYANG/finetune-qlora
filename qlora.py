@@ -109,11 +109,11 @@ class DataArguments:
         },
     )
     source_max_len: int = field(
-        default=1024, #1024
+        default=4096, #1024
         metadata={"help": "Maximum source sequence length. Sequences will be right padded (and possibly truncated)."},
     )
     target_max_len: int = field(
-        default=512, #256
+        default=2048, #256
         metadata={"help": "Maximum target sequence length. Sequences will be right padded (and possibly truncated)."},
     )
     dataset: str = field(
@@ -202,7 +202,7 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
     optim: str = field(default='paged_adamw_32bit', metadata={"help": 'The optimizer to be used'})
     per_device_train_batch_size: int = field(default=1, metadata={"help": 'The training batch size per GPU. Increase for better speed.'})
     gradient_accumulation_steps: int = field(default=16, metadata={"help": 'How many gradients to accumulate before to perform an optimizer step'})
-    max_steps: int = field(default=150, metadata={"help": 'How many optimizer update steps to take'}) #10000;2000;500
+    max_steps: int = field(default=500, metadata={"help": 'How many optimizer update steps to take'}) #10000;2000;500
     # 200
     weight_decay: float = field(default=0.0, metadata={"help": 'The L2 weight decay rate of AdamW'}) # use lora dropout instead for regularization if needed
     learning_rate: float = field(default=0.0002, metadata={"help": 'The learnign rate'})
@@ -215,7 +215,7 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
     logging_steps: int = field(default=10, metadata={"help": 'The frequency of update steps after which to log the loss'})
     group_by_length: bool = field(default=True, metadata={"help": 'Group sequences into batches with same length. Saves memory and speeds up training considerably.'})
     save_strategy: str = field(default='steps', metadata={"help": 'When to save checkpoints'})
-    save_steps: int = field(default=250, metadata={"help": 'How often to save a model'})
+    save_steps: int = field(default=50, metadata={"help": 'How often to save a model'})
     save_total_limit: int = field(default=40, metadata={"help": 'How many checkpoints to save before the oldest is overwritten'})
 
 @dataclass
@@ -224,7 +224,7 @@ class GenerationArguments:
     # https://huggingface.co/docs/transformers/main_classes/text_generation#transformers.GenerationConfig
     # Length arguments
     max_new_tokens: Optional[int] = field(
-        default=512, #256
+        default=2048, #256
         metadata={"help": "Maximum number of new tokens to be generated in evaluation or prediction loops"
                           "if predict_with_generate is set."}
     )
@@ -328,7 +328,7 @@ def get_accelerate_model(args, checkpoint_dir):
         cache_dir=args.cache_dir,
         # load_in_4bit=args.bits == 4,
         load_in_8bit=args.bits == 8,
-        # device_map=device_map,
+        device_map=device_map,
         max_memory=max_memory,
         # max_memory = {i: '46000MB' for i in range(torch.cuda.device_count())},
         quantization_config=BitsAndBytesConfig(
@@ -340,7 +340,7 @@ def get_accelerate_model(args, checkpoint_dir):
             bnb_4bit_use_double_quant=args.double_quant,
             bnb_4bit_quant_type=args.quant_type,
         ),
-        torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)),
+        dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)),
         trust_remote_code=args.trust_remote_code,
         use_auth_token=args.use_auth_token
     )
@@ -357,7 +357,7 @@ def get_accelerate_model(args, checkpoint_dir):
     setattr(model, 'model_parallel', True)
     setattr(model, 'is_parallelizable', True)
 
-    model.config.torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32))
+    model.config.dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32))
 
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
@@ -421,7 +421,11 @@ def get_accelerate_model(args, checkpoint_dir):
                 bias="none",
                 task_type="CAUSAL_LM",
             )
+            print("Done lora config")
+            print(config)
+            print(model)
             model = get_peft_model(model, config)
+            print("Done getting peft model")
             # model._set_static_graph()
 
     for name, module in model.named_modules():
